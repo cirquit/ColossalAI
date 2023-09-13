@@ -22,4 +22,5 @@ torchrun --standalone --nproc_per_node=${GPUNUM} ./train_gpt_demo.py \
 --batch_size=${BATCH_SIZE} \
 --distplan=${DISTPLAN} \
 --train_step=${TRAIN_STEP} \
+--gpu_num=${GPUNUM} \
 2>&1 | tee ./gemini_logs/${MODEL_TYPE}_${DISTPLAN}_gpu_${GPUNUM}_bs_${BATCH_SIZE}_tp_${TPDEGREE}_${PLACEMENT}.log

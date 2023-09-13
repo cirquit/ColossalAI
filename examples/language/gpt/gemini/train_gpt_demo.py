@@ -1,7 +1,7 @@
 import os
 from contextlib import nullcontext
 from functools import partial
-from time import time
+from time import time as mtime
 
 import psutil
 import torch
@@ -20,6 +20,12 @@ from colossalai.nn.optimizer import HybridAdam
 from colossalai.utils import get_current_device
 
 CAI_VERSION = colossalai.__version__
+
+import time
+
+from utils.monitor import Monitor
+from utils.tb_logger import TBLogger
+from utils.timers import TBTimeIt as timeit
 
 
 def parse_args():
@@ -45,9 +51,16 @@ def parse_args():
     parser.add_argument(
         "--train_step",
         type=int,
-        default=10,
+        default=40,
         help="training iterations for test",
     )
+    parser.add_argument(
+        "--gpu_num",
+        type=int,
+        default=2,
+        help="number of gpus",
+    )
+
 
     args = parser.parse_args()
     return args
@@ -202,29 +215,48 @@ def main():
     model.train()
     tflops_list = []
 
-    def train_step():
+    def train_step(tblogger, step_counter, monitor, batch_size):
+        step_time_start_s = time.perf_counter()
+        
         # we just use randomly generated data here
         input_ids, attn_mask = get_data(BATCH_SIZE, SEQ_LEN, VOCAB_SIZE)
+        dataload_time_s = time.perf_counter() - step_time_start_s
         optimizer.zero_grad()
 
-        start = time()
-        outputs = model(input_ids, attn_mask)
+        start = mtime()
+        with timeit("forward", tblogger) as forward_timer:
+            outputs = model(input_ids, attn_mask)
         loss = criterion(outputs, input_ids)
         torch.cuda.synchronize()
-        fwd_end = time()
+        fwd_end = mtime()
         fwd_time = fwd_end - start
         logger.info(get_mem_info(prefix=f'[{n + 1}/{NUM_STEPS}] Forward '), ranks=[0])
-        booster.backward(loss, optimizer)
+
+        with timeit("backward", tblogger) as backward_timer:
+            booster.backward(loss, optimizer)
 
         torch.cuda.synchronize()
-        bwd_end = time()
+        bwd_end = mtime()
         bwd_time = bwd_end - fwd_end
         logger.info(get_mem_info(prefix=f'[{n + 1}/{NUM_STEPS}] Backward '), ranks=[0])
-
-        optimizer.step()
+        with timeit("opt_step", tblogger) as opt_step_timer:
+            optimizer.step()
         torch.cuda.synchronize()
-        optim_time = time() - bwd_end
-        step_time = time() - start
+        optim_time = mtime() - bwd_end
+        step_time = mtime() - start
+
+        tblogger.log_dict(monitor.get_sys_info())
+        tblogger.log("02_timing/dataload_time_s", dataload_time_s)
+        tblogger.log("01_general/step", step_counter)
+        tblogger.log("02_timing/dataload_time_s", dataload_time_s)
+        # restarting timer for dataload due to iterator
+        actual_step_time_s = time.perf_counter() - step_time_start_s
+        step_time_start_s = time.perf_counter()
+        samples_per_second = batch_size / actual_step_time_s
+        tokens_per_second = (batch_size * 1024) / actual_step_time_s
+        tblogger.log("01_general/sps", samples_per_second)
+        tblogger.log("01_general/tokens_per_s", tokens_per_second, commit=True)
+ 
         logger.info(get_mem_info(prefix=f'[{n + 1}/{NUM_STEPS}] Optimizer step '), ranks=[0])
 
         step_tflops = get_tflops_func(step_time)
@@ -240,16 +272,22 @@ def main():
                                         NUM_STEPS - WARMUP_STEPS,
                                         save_dir=f"profile/{get_time_stamp()}-demo")
 
+
+    run_name = f"{args.distplan}-{args.batch_size}-{args.gpu_num}-{args.train_step}"
+
+    monitor = Monitor(cuda_enabled=True)
     with demo_profiler as prof:
-        for n in range(NUM_STEPS):
-            train_step()
-            prof.step()
+        with TBLogger(run_name=run_name) as tblogger:
+            for key, val in vars(args).items():
+                tblogger.log_text(f"00_cfg/{key}", str(val))
+            for n in range(NUM_STEPS):
+                train_step(tblogger=tblogger, step_counter=n, monitor=monitor, batch_size=args.batch_size)
+                prof.step()
 
     tflops_list.sort()
     median_index = ((NUM_STEPS - WARMUP_STEPS) >> 1) + WARMUP_STEPS
     logger.info(f"Median TFLOPS is {tflops_list[median_index]:.3f}")
     torch.cuda.synchronize()
-
 
 if __name__ == '__main__':
     main()
